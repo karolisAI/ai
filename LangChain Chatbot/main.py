@@ -1,22 +1,32 @@
 import streamlit as st
 from langchain.chains import ConversationalRetrievalChain
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
 from helpers.rag import get_combined_retriever
 from helpers.functions import calculate_calories, generate_workout, recommend_supplements, WorkoutGenerationError, format_calorie_response
-from helpers.monitoring import log_query, validate_input, rate_limiter
+from helpers.monitoring import log_query, validate_input, rate_limiter, validate_embeddings, log_embedding_operation
 from helpers.security import (
     validate_health_metrics, sanitize_workout_input, validate_exercise_safety,
     validate_supplement_input, log_security_event, validate_user_age_consent,
     check_health_warning_conditions
 )
-from langchain.agents import Tool
+from langchain_core.tools import Tool
 import os
 import base64
 import json
 from datetime import datetime
 
 from dotenv import load_dotenv
+from helpers.document_manager import DocumentManager
+from helpers.baseretriever import EnhancedRetriever
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.memory import BaseMemory
+from langchain_community.cache import InMemoryCache
+from pydantic import BaseModel, Field
+import gc
+import langchain
+from typing import Any, Dict, List
+import logging
 
 load_dotenv()
 OPENAI_API = os.getenv("OPENAI_API_KEY")
@@ -209,35 +219,198 @@ tools = [
     )
 ]
 
-# cache the setup of the chain to avoid re-initializing it on every interaction
+# Initialize document manager
+document_manager = DocumentManager()
+
+# Add document upload section in sidebar
+with st.sidebar.expander("📚 Upload Documents"):
+    st.markdown("""
+        Upload your own fitness-related documents to enhance the knowledge base.
+        Supported formats: PDF, TXT
+    """)
+    
+    uploaded_file = st.file_uploader("Choose a file", type=['pdf', 'txt'])
+    if uploaded_file:
+        if st.button("Process Document"):
+            with st.spinner("Processing document..."):
+                try:
+                    # Save the file
+                    file_path = document_manager.save_uploaded_file(uploaded_file)
+                    if file_path:
+                        # Process the document
+                        chunks = document_manager.process_document(file_path)
+                        if chunks:
+                            # Initialize a new retriever just for this document
+                            temp_retriever = get_combined_retriever("", [], max_tokens=1500)
+                            
+                            # Precompute embeddings for the chunks
+                            from langchain_openai import OpenAIEmbeddings
+                            from helpers.rag import batch_embed
+                            
+                            embedder = OpenAIEmbeddings(api_key=OPENAI_API)
+                            texts = [doc.page_content for doc in chunks]
+                            metadatas = [doc.metadata for doc in chunks]
+                            ids = [f"doc_{i}" for i in range(len(chunks))]
+                            
+                            try:
+                                # Use the improved batch_embed function with retries
+                                embeddings = batch_embed(texts, embedder, batch_size=50, max_retries=3)
+                                
+                                # Validate embeddings before adding to collection
+                                validate_embeddings(embeddings)
+                                
+                                # Add to Chroma collection directly
+                                collection = temp_retriever._base_retriever.vectorstore._collection
+                                
+                                # Add documents in smaller batches to avoid memory issues
+                                batch_size = 50  # Use smaller batch size for collection addition
+                                for i in range(0, len(texts), batch_size):
+                                    batch_texts = texts[i:i + batch_size]
+                                    batch_metadatas = metadatas[i:i + batch_size]
+                                    batch_ids = ids[i:i + batch_size]
+                                    batch_embeddings = embeddings[i:i + batch_size]
+                                    
+                                    try:
+                                        collection.add(
+                                            documents=batch_texts,
+                                            metadatas=batch_metadatas,
+                                            ids=batch_ids,
+                                            embeddings=batch_embeddings
+                                        )
+                                        log_embedding_operation(
+                                            "collection_add",
+                                            len(batch_texts),
+                                            len(texts),
+                                            success=True
+                                        )
+                                    except Exception as e:
+                                        log_embedding_operation(
+                                            "collection_add",
+                                            len(batch_texts),
+                                            len(texts),
+                                            success=False,
+                                            error=e
+                                        )
+                                        raise
+                                
+                                st.success(f"Successfully processed and embedded {len(chunks)} chunks from the document.")
+                            except Exception as e:
+                                st.error(f"Error during embedding process: {str(e)}")
+                                logging.error(f"Embedding process error: {str(e)}")
+                                raise
+                        else:
+                            st.error("No text chunks were extracted from the document.")
+                    else:
+                        st.error("Failed to save the uploaded file.")
+                except Exception as e:
+                    st.error(f"Error processing document: {str(e)}")
+                    logging.error(f"Document processing error: {str(e)}")
+    
+    # Show uploaded documents
+    st.markdown("### Your Documents")
+    documents = document_manager.get_uploaded_documents()
+    if documents:
+        for doc in documents:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write(doc)
+            with col2:
+                if st.button("🗑️", key=f"delete_{doc}"):
+                    if document_manager.delete_document(doc):
+                        st.success("Document deleted")
+                        st.rerun()
+    else:
+        st.info("No documents uploaded yet")
+
+# Initialize cache
+langchain.cache = InMemoryCache()
+
+# Configure memory management
+MEMORY_WINDOW = 5  # Number of message pairs to keep in memory
+MAX_TOKENS_PER_QUERY = 1000
+
+class WindowedMemory(BaseMemory, BaseModel):
+    messages: List[dict] = Field(default_factory=list)
+    k: int = Field(default=5)
+    return_messages: bool = Field(default=True)
+    output_key: str = Field(default="answer")
+    input_key: str = Field(default="question")
+    memory_key: str = Field(default="chat_history")
+
+    @property
+    def memory_variables(self) -> List[str]:
+        return [self.memory_key]
+
+    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        return {self.memory_key: self.messages[-self.k * 2:] if self.messages else []}
+
+    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
+        if self.input_key not in inputs:
+            raise ValueError(f"input key {self.input_key} not found in inputs")
+        
+        # Save user message
+        self.messages.append({
+            "type": "human",
+            "content": inputs[self.input_key]
+        })
+        
+        # Save AI message
+        if self.output_key in outputs:
+            self.messages.append({
+                "type": "ai",
+                "content": outputs[self.output_key]
+            })
+        
+        # Maintain window size
+        if len(self.messages) > self.k * 2:
+            self.messages = self.messages[-self.k * 2:]
+
+    def clear(self) -> None:
+        self.messages = []
+
 @st.cache_resource(show_spinner="Initializing knowledge base...")
 def setup_chain():
-    retriever = get_combined_retriever(PDF_DIR, FITNESS_URLS, max_tokens=1500)
-    llm = ChatOpenAI(api_key=os.getenv('OPENAI_API_KEY'), temperature=0.7)
+    return get_combined_retriever(PDF_DIR, FITNESS_URLS, max_tokens=1500)
+
+def cleanup_memory():
+    """Clean up memory and cache periodically."""
+    # Clear the retriever's cache
+    if 'chain' in st.session_state:
+        st.session_state.chain.retriever.clear_cache()
     
-    # initialize the agent with tools
-    agent = initialize_agent(
-        tools,
-        llm,
-        agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
-        verbose=True,
-        max_iterations=3,
-        early_stopping_method='generate'
-    )
+    # Force garbage collection
+    gc.collect()
+
+# Add memory cleanup to the main processing function
+def process_with_knowledge_base(input_text):
+    """Process user input with knowledge base and memory management."""
+    try:
+        # Validate input
+        validate_input(input_text)
+        
+        # Process with rate limiting
+        @rate_limiter
+        def process():
+            chain = setup_chain()
+            result = chain.invoke({"question": input_text})
+            
+            # Log the query
+            log_query(input_text, result)
+            
+            # Clean up memory periodically
+            cleanup_memory()
+            
+            return result
+        
+        return process()
     
-    # initialize the QA chain for knowledge base
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        return_source_documents=True
-    )
-    
-    return agent, qa_chain
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+        log_security_event("error", str(e))
+        return None
 
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
-
-agent, qa_chain = setup_chain()
 
 st.title("🏋️ AI Bodybuilding Coach")
 st.markdown("""
@@ -436,8 +609,27 @@ def handle_supplement_command():
         except Exception as e:
             st.error(f"Error getting supplement recommendations: {str(e)}")
 
+def visualize_rag_process(query, result):
+    """Visualize the RAG process with source information"""
+    with st.expander("🔍 View Sources and Context"):
+        st.markdown("### Retrieved Context")
+        
+        # Display source documents
+        for i, doc in enumerate(result.get("source_documents", []), 1):
+            with st.container():
+                st.markdown(f"**Source {i}:**")
+                source_type = doc.metadata.get("source_type", "unknown")
+                if source_type == "web":
+                    st.markdown(f"🌐 Web: {doc.metadata.get('url', 'Unknown URL')}")
+                elif source_type == "pdf":
+                    st.markdown(f"📄 PDF: {doc.metadata.get('file_name', 'Unknown File')}")
+                
+                st.markdown("**Relevant Content:**")
+                st.markdown(doc.page_content)
+                st.markdown("---")
+
 if (submit_button or user_input) and user_input:
-    if agent is None or qa_chain is None:
+    if process_with_knowledge_base(user_input) is None:
         st.error("Chatbot is currently unavailable. Please try again later.")
     else:
         with st.spinner("Generating your answer..."):
@@ -458,7 +650,7 @@ if (submit_button or user_input) and user_input:
                     try:
                         @rate_limiter
                         def process_with_tools(input_text):
-                            return agent.run(input=input_text)
+                            return process_with_tools(input_text)
                         
                         response = process_with_tools(validated_input)
                         log_query(validated_input, response, source="tools")
@@ -469,58 +661,16 @@ if (submit_button or user_input) and user_input:
                         # if tools can't handle it, use the knowledge base
                         @rate_limiter
                         def process_with_knowledge_base(input_text):
-                            return qa_chain({"question": input_text, "chat_history": st.session_state["chat_history"]})
+                            return process_with_knowledge_base(input_text)
                         
                         result = process_with_knowledge_base(validated_input)
-                        log_query(validated_input, result["answer"], source="knowledge_base")
-                        st.session_state["chat_history"].append((validated_input, result["answer"]))
+                        log_query(validated_input, result, source="knowledge_base")
+                        st.session_state["chat_history"].append((validated_input, result))
                         
                         st.write("**Answer:**")
-                        st.write(result["answer"])
+                        st.write(result)
                         
                         # display source URLs
-                        with st.expander("📖 Sources"):
-                            for i, doc in enumerate(result["source_documents"], 1):
-                                source = doc.metadata.get('source')
-                                st.write(f"**Source {i}:**")
-                                
-                                # display source type icon
-                                icon = "📄" if source.endswith('.pdf') else "🌐"
-                                
-                                # display relevance score if available
-                                if 'score' in doc.metadata:
-                                    st.write(f"Relevance: {doc.metadata['score']:.2f}")
-                                
-                                # display snippet of matched content
-                                st.write("**Relevant Extract:**")
-                                st.markdown(f">{doc.page_content[:200]}...")
-                                
-                                # display source link
-                                if source.endswith('.pdf'):
-                                    pdf_path = os.path.join(PDF_DIR, source)
-                                    if os.path.exists(pdf_path):
-                                        pdf_link = create_pdf_link(pdf_path, source)
-                                        st.markdown(f"{icon} {pdf_link}", unsafe_allow_html=True)
-                                else:
-                                    st.markdown(f"{icon} [{source}]({source})")
-                                st.markdown("---")
-
-                        def visualize_rag_process(query, result):
-                            st.write("🔍 **RAG Process Visualization**")
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
-                                st.write("1️⃣ **Query Processing**")
-                                st.info(f"User Query: {query}")
-                            
-                            with col2:
-                                st.write("2️⃣ **Document Retrieval**")
-                                st.info(f"Found {len(result['source_documents'])} relevant documents")
-                            
-                            with col3:
-                                st.write("3️⃣ **Response Generation**")
-                                st.info("Generated response using retrieved context")
-
                         visualize_rag_process(validated_input, result)
 
             except ValueError as ve:
