@@ -2,7 +2,7 @@ import streamlit as st
 from langchain.chains import ConversationalRetrievalChain
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from helpers.rag import get_combined_retriever
+from helpers.rag import get_combined_retriever, get_rag_chain
 from helpers.functions import calculate_calories, generate_workout, recommend_supplements, WorkoutGenerationError, format_calorie_response
 from helpers.monitoring import log_query, validate_input, rate_limiter, validate_embeddings, log_embedding_operation
 from helpers.security import (
@@ -27,6 +27,7 @@ import gc
 import langchain
 from typing import Any, Dict, List
 import logging
+import re
 
 load_dotenv()
 OPENAI_API = os.getenv("OPENAI_API_KEY")
@@ -222,54 +223,34 @@ tools = [
 # Initialize document manager
 document_manager = DocumentManager()
 
-# Add document upload section in sidebar
-with st.sidebar.expander("📚 Upload Documents"):
-    st.markdown("""
-        Upload your own fitness-related documents to enhance the knowledge base.
-        Supported formats: PDF, TXT
-    """)
-    
+# --- Modularize Document Upload ---
+def handle_document_upload():
     uploaded_file = st.file_uploader("Choose a file", type=['pdf', 'txt'])
     if uploaded_file:
         if st.button("Process Document"):
             with st.spinner("Processing document..."):
                 try:
-                    # Save the file
                     file_path = document_manager.save_uploaded_file(uploaded_file)
                     if file_path:
-                        # Process the document
                         chunks = document_manager.process_document(file_path)
                         if chunks:
-                            # Initialize a new retriever just for this document
                             temp_retriever = get_combined_retriever("", [], max_tokens=1500)
-                            
-                            # Precompute embeddings for the chunks
                             from langchain_openai import OpenAIEmbeddings
                             from helpers.rag import batch_embed
-                            
                             embedder = OpenAIEmbeddings(api_key=OPENAI_API)
                             texts = [doc.page_content for doc in chunks]
                             metadatas = [doc.metadata for doc in chunks]
                             ids = [f"doc_{i}" for i in range(len(chunks))]
-                            
                             try:
-                                # Use the improved batch_embed function with retries
                                 embeddings = batch_embed(texts, embedder, batch_size=50, max_retries=3)
-                                
-                                # Validate embeddings before adding to collection
                                 validate_embeddings(embeddings)
-                                
-                                # Add to Chroma collection directly
                                 collection = temp_retriever._base_retriever.vectorstore._collection
-                                
-                                # Add documents in smaller batches to avoid memory issues
-                                batch_size = 50  # Use smaller batch size for collection addition
+                                batch_size = 50
                                 for i in range(0, len(texts), batch_size):
                                     batch_texts = texts[i:i + batch_size]
                                     batch_metadatas = metadatas[i:i + batch_size]
                                     batch_ids = ids[i:i + batch_size]
                                     batch_embeddings = embeddings[i:i + batch_size]
-                                    
                                     try:
                                         collection.add(
                                             documents=batch_texts,
@@ -292,7 +273,6 @@ with st.sidebar.expander("📚 Upload Documents"):
                                             error=e
                                         )
                                         raise
-                                
                                 st.success(f"Successfully processed and embedded {len(chunks)} chunks from the document.")
                             except Exception as e:
                                 st.error(f"Error during embedding process: {str(e)}")
@@ -305,7 +285,6 @@ with st.sidebar.expander("📚 Upload Documents"):
                 except Exception as e:
                     st.error(f"Error processing document: {str(e)}")
                     logging.error(f"Document processing error: {str(e)}")
-    
     # Show uploaded documents
     st.markdown("### Your Documents")
     documents = document_manager.get_uploaded_documents()
@@ -322,6 +301,13 @@ with st.sidebar.expander("📚 Upload Documents"):
     else:
         st.info("No documents uploaded yet")
 
+with st.sidebar.expander("📚 Upload Documents"):
+    st.markdown("""
+        Upload your own fitness-related documents to enhance the knowledge base.
+        Supported formats: PDF, TXT
+    """)
+    handle_document_upload()
+
 # Initialize cache
 langchain.cache = InMemoryCache()
 
@@ -329,48 +315,9 @@ langchain.cache = InMemoryCache()
 MEMORY_WINDOW = 5  # Number of message pairs to keep in memory
 MAX_TOKENS_PER_QUERY = 1000
 
-class WindowedMemory(BaseMemory, BaseModel):
-    messages: List[dict] = Field(default_factory=list)
-    k: int = Field(default=5)
-    return_messages: bool = Field(default=True)
-    output_key: str = Field(default="answer")
-    input_key: str = Field(default="question")
-    memory_key: str = Field(default="chat_history")
-
-    @property
-    def memory_variables(self) -> List[str]:
-        return [self.memory_key]
-
-    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        return {self.memory_key: self.messages[-self.k * 2:] if self.messages else []}
-
-    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
-        if self.input_key not in inputs:
-            raise ValueError(f"input key {self.input_key} not found in inputs")
-        
-        # Save user message
-        self.messages.append({
-            "type": "human",
-            "content": inputs[self.input_key]
-        })
-        
-        # Save AI message
-        if self.output_key in outputs:
-            self.messages.append({
-                "type": "ai",
-                "content": outputs[self.output_key]
-            })
-        
-        # Maintain window size
-        if len(self.messages) > self.k * 2:
-            self.messages = self.messages[-self.k * 2:]
-
-    def clear(self) -> None:
-        self.messages = []
-
 @st.cache_resource(show_spinner="Initializing knowledge base...")
 def setup_chain():
-    return get_combined_retriever(PDF_DIR, FITNESS_URLS, max_tokens=1500)
+    return get_rag_chain(PDF_DIR, FITNESS_URLS, max_tokens=1500)
 
 def cleanup_memory():
     """Clean up memory and cache periodically."""
@@ -381,33 +328,62 @@ def cleanup_memory():
     # Force garbage collection
     gc.collect()
 
-# Add memory cleanup to the main processing function
-def process_with_knowledge_base(input_text):
-    """Process user input with knowledge base and memory management."""
+# --- Chat History Helpers ---
+def get_chat_history():
+    chat_history = st.session_state.get("chat_history", [])
+    # Ensure it's a list of tuples
+    if not isinstance(chat_history, list) or any(not isinstance(x, tuple) or len(x) != 2 for x in chat_history):
+        st.session_state["chat_history"] = []
+        return []
+    return chat_history
+
+def update_chat_history(question, answer):
+    chat_history = get_chat_history()
+    chat_history.append((question, answer))
+    st.session_state["chat_history"] = chat_history
+
+# --- Centralized Chat Handler ---
+def handle_chat_interaction(user_input):
     try:
-        # Validate input
-        validate_input(input_text)
-        
-        # Process with rate limiting
-        @rate_limiter
-        def process():
-            chain = setup_chain()
-            result = chain.invoke({"question": input_text})
-            
-            # Log the query
-            log_query(input_text, result)
-            
-            # Clean up memory periodically
-            cleanup_memory()
-            
-            return result
-        
-        return process()
-    
-    except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
-        log_security_event("error", str(e))
+        validated_input = validate_input(user_input)
+        chat_history = get_chat_history()
+        formatted_history = format_chat_history(chat_history) if chat_history else ""
+        chain = setup_chain()
+        result = chain.invoke({
+            "question": validated_input,
+            "chat_history": chat_history,
+            "formatted_history": formatted_history
+        })
+        if result is None:
+            st.error("Chatbot is currently unavailable. Please try again later.")
+            return None
+        answer = result.get("answer", "No answer found.")
+        # Fallback logic: if no relevant context, let LLM answer from its own knowledge
+        source_docs = result.get("source_documents", [])
+        if not source_docs or all(not doc.page_content.strip() for doc in source_docs):
+            if not answer or answer.strip().lower() in ["i don't know", "no answer found."]:
+                answer = "I'm sorry, I couldn't find relevant information in the knowledge base, but here's what I know: " + validated_input
+        update_chat_history(validated_input, answer)
+        log_query(validated_input, answer, source="knowledge_base")
+        cleanup_memory()
+        return {"answer": answer, "result": result, "question": validated_input}
+    except ValueError as ve:
+        st.error(str(ve))
+        log_query(user_input, f"Error: {str(ve)}", source="error")
         return None
+    except Exception as e:
+        st.error(f"An error occurred while fetching the response: {e}")
+        log_query(user_input, f"Error: {str(e)}", source="error")
+        return None
+
+def format_chat_history(chat_history):
+    """Format chat history as a readable numbered list of Q&A pairs."""
+    if not chat_history:
+        return ""
+    lines = []
+    for i, (q, a) in enumerate(chat_history, 1):
+        lines.append(f"Q{i}: {q}\nA{i}: {a}")
+    return "\n".join(lines)
 
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
@@ -609,75 +585,64 @@ def handle_supplement_command():
         except Exception as e:
             st.error(f"Error getting supplement recommendations: {str(e)}")
 
+def extract_relevant_text(query, content):
+    """Return the most relevant sentence or paragraph for the query from the content."""
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', content.strip())
+    # Find the sentence with the most query word overlap
+    query_words = set(query.lower().split())
+    best_sentence = max(sentences, key=lambda s: len(query_words & set(s.lower().split())), default=sentences[0] if sentences else "")
+    # Optionally, return the paragraph containing the best sentence
+    paragraphs = content.split('\n\n')
+    for para in paragraphs:
+        if best_sentence in para:
+            return para.strip()
+    return best_sentence.strip()
+
 def visualize_rag_process(query, result):
     """Visualize the RAG process with source information"""
     with st.expander("🔍 View Sources and Context"):
         st.markdown("### Retrieved Context")
-        
-        # Display source documents
-        for i, doc in enumerate(result.get("source_documents", []), 1):
-            with st.container():
-                st.markdown(f"**Source {i}:**")
-                source_type = doc.metadata.get("source_type", "unknown")
-                if source_type == "web":
-                    st.markdown(f"🌐 Web: {doc.metadata.get('url', 'Unknown URL')}")
-                elif source_type == "pdf":
-                    st.markdown(f"📄 PDF: {doc.metadata.get('file_name', 'Unknown File')}")
-                
-                st.markdown("**Relevant Content:**")
-                st.markdown(doc.page_content)
-                st.markdown("---")
+        answer = result.get("answer", "")
+        source_docs = result.get("source_documents", [])
+        if not source_docs or all(not doc.page_content.strip() for doc in source_docs):
+            st.info("No knowledge base source used for this answer.")
+        else:
+            # Deduplicate by source
+            seen_sources = set()
+            for doc in source_docs:
+                source = doc.metadata.get("source", "")
+                if source in seen_sources:
+                    continue
+                seen_sources.add(source)
+                with st.container():
+                    st.markdown(f"**Source {len(seen_sources)}:**")
+                    if source.startswith("http"):
+                        st.markdown(f"🌐 Web: [{source}]({source})")
+                        # Hide irrelevant content for web sources
+                    else:
+                        st.markdown(f"📄 PDF: {source}")
+                        # Show only the most relevant sentence/paragraph for PDFs
+                        relevant = extract_relevant_text(query, doc.page_content)
+                        st.markdown("**Relevant Content:**")
+                        st.markdown(relevant or "_No relevant content_")
+                    st.markdown("---")
 
 if (submit_button or user_input) and user_input:
-    if process_with_knowledge_base(user_input) is None:
-        st.error("Chatbot is currently unavailable. Please try again later.")
-    else:
-        with st.spinner("Generating your answer..."):
-            try:
-                # check for special commands first
-                lower_input = user_input.lower().strip()
-                if lower_input == "workout plan":
-                    handle_workout_plan_command()
-                elif lower_input == "calculate calories":
-                    handle_calorie_calculator_command()
-                elif lower_input == "supplements":
-                    handle_supplement_command()
-                else:
-                    # proceed with the existing general query handling
-                    validated_input = validate_input(user_input)
-                    
-                    # first try to use the tools
-                    try:
-                        @rate_limiter
-                        def process_with_tools(input_text):
-                            return process_with_tools(input_text)
-                        
-                        response = process_with_tools(validated_input)
-                        log_query(validated_input, response, source="tools")
-                        st.session_state["chat_history"].append((validated_input, response))
-                        st.write("**Answer:**")
-                        st.write(response)
-                    except Exception as agent_error:
-                        # if tools can't handle it, use the knowledge base
-                        @rate_limiter
-                        def process_with_knowledge_base(input_text):
-                            return process_with_knowledge_base(input_text)
-                        
-                        result = process_with_knowledge_base(validated_input)
-                        log_query(validated_input, result, source="knowledge_base")
-                        st.session_state["chat_history"].append((validated_input, result))
-                        
-                        st.write("**Answer:**")
-                        st.write(result)
-                        
-                        # display source URLs
-                        visualize_rag_process(validated_input, result)
-
-            except ValueError as ve:
-                st.error(str(ve))
-            except Exception as e:
-                st.error(f"An error occurred while fetching the response: {e}")
-                log_query(validated_input, f"Error: {str(e)}", source="error")
+    with st.spinner("Generating your answer..."):
+        lower_input = user_input.lower().strip()
+        if lower_input == "workout plan":
+            handle_workout_plan_command()
+        elif lower_input == "calculate calories":
+            handle_calorie_calculator_command()
+        elif lower_input == "supplements":
+            handle_supplement_command()
+        else:
+            chat_result = handle_chat_interaction(user_input)
+            if chat_result:
+                st.write("**Answer:**")
+                st.write(chat_result["answer"])
+                visualize_rag_process(chat_result["question"], chat_result["result"])
 
 # display chat history
 if st.session_state["chat_history"]:

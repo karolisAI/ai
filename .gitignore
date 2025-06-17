@@ -1,0 +1,5 @@
+fitness_bot.log
+streamlit_output.log
+.env
+.venv
+.vscode
