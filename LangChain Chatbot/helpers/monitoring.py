@@ -2,7 +2,6 @@ import logging
 import time
 from datetime import datetime
 from functools import wraps
-import os
 import streamlit as st
 from collections import defaultdict
 

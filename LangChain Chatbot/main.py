@@ -1,13 +1,10 @@
 import streamlit as st
-from langchain.chains import ConversationalRetrievalChain
-from langchain_openai import ChatOpenAI
-from langchain.agents import initialize_agent, AgentType
-from helpers.rag import get_combined_retriever, get_rag_chain
+from helpers.rag import get_rag_chain
 from helpers.functions import calculate_calories, generate_workout, recommend_supplements, WorkoutGenerationError, format_calorie_response
-from helpers.monitoring import log_query, validate_input, rate_limiter, validate_embeddings, log_embedding_operation
+from helpers.monitoring import log_query, validate_input, validate_embeddings, log_embedding_operation
 from helpers.security import (
     validate_health_metrics, sanitize_workout_input, validate_exercise_safety,
-    validate_supplement_input, log_security_event, validate_user_age_consent,
+    validate_supplement_input, validate_user_age_consent,
     check_health_warning_conditions
 )
 from langchain_core.tools import Tool
@@ -18,16 +15,12 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from helpers.document_manager import DocumentManager
-from helpers.baseretriever import EnhancedRetriever
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.memory import BaseMemory
 from langchain_community.cache import InMemoryCache
-from pydantic import BaseModel, Field
 import gc
 import langchain
-from typing import Any, Dict, List
 import logging
 import re
+import unicodedata
 
 load_dotenv()
 OPENAI_API = os.getenv("OPENAI_API_KEY")
@@ -234,7 +227,7 @@ def handle_document_upload():
                     if file_path:
                         chunks = document_manager.process_document(file_path)
                         if chunks:
-                            temp_retriever = get_combined_retriever("", [], max_tokens=1500)
+                            temp_retriever = get_rag_chain("", [], max_tokens=1500)
                             from langchain_openai import OpenAIEmbeddings
                             from helpers.rag import batch_embed
                             embedder = OpenAIEmbeddings(api_key=OPENAI_API)
@@ -315,8 +308,12 @@ langchain.cache = InMemoryCache()
 MEMORY_WINDOW = 5  # Number of message pairs to keep in memory
 MAX_TOKENS_PER_QUERY = 1000
 
+APP_VERSION = "v1.0-debug-fh"
+
+st.sidebar.info(f"App Version: {APP_VERSION}")
+
 @st.cache_resource(show_spinner="Initializing knowledge base...")
-def setup_chain():
+def setup_chain(app_version=APP_VERSION):
     return get_rag_chain(PDF_DIR, FITNESS_URLS, max_tokens=1500)
 
 def cleanup_memory():
@@ -342,31 +339,73 @@ def update_chat_history(question, answer):
     chat_history.append((question, answer))
     st.session_state["chat_history"] = chat_history
 
+# --- Meta-question detection helpers ---
+def _normalize(text: str) -> str:
+    """Lower-case and strip accents for crude matching."""
+    text = text.lower().strip()
+    return unicodedata.normalize("NFKD", text)
+
+def detect_history_request(text: str):
+    """Return one of 'list', 'last', None based on user query."""
+    t = _normalize(text)
+    if "last question" in t:
+        return "last"
+    # list/show all questions i have asked
+    if "question" in t and ("list" in t or "show" in t or "all" in t):
+        return "list"
+    return None
+
+def answer_history_request(kind: str):
+    hist = get_chat_history()
+    if not hist:
+        return "You haven't asked any questions yet."
+    if kind == "last":
+        return f'Your last question was: "{hist[-1][0]}"'
+    if kind == "list":
+        qs = [q for q, _ in hist]
+        numbered = "\n".join(f"{i+1}. {q}" for i, q in enumerate(qs))
+        return "Here are all your questions so far:\n" + numbered
+    return "I'm not sure which part of the chat history you want."
+
 # --- Centralized Chat Handler ---
 def handle_chat_interaction(user_input):
     try:
         validated_input = validate_input(user_input)
-        chat_history = get_chat_history()
-        formatted_history = format_chat_history(chat_history) if chat_history else ""
-        chain = setup_chain()
-        result = chain.invoke({
+
+        # Quick path for meta-questions about previous user turns
+        meta_kind = detect_history_request(validated_input)
+        if meta_kind:
+            answer = answer_history_request(meta_kind)
+            update_chat_history(validated_input, answer)
+            return {"answer": answer, "result": {"source_documents": []}, "question": validated_input}
+
+        chain = setup_chain(APP_VERSION)
+        # get chat history as BaseMessage list from chain memory (or empty list)
+        try:
+            mem_vars = chain.memory.load_memory_variables({}) if hasattr(chain, "memory") else {}
+            hist_msgs = mem_vars.get("chat_history", [])
+        except Exception:
+            hist_msgs = []
+
+        input_dict = {
             "question": validated_input,
-            "chat_history": chat_history,
-            "formatted_history": formatted_history
-        })
+            "chat_history": hist_msgs  # satisfies MessagesPlaceholder
+        }
+        print(f"[DEBUG] chain.invoke input: {input_dict}")
+        result = chain.invoke(input_dict)
         if result is None:
             st.error("Chatbot is currently unavailable. Please try again later.")
             return None
-        answer = result.get("answer", "No answer found.")
+        _ans = result.get("answer", result.get("result", "No answer found."))
         # Fallback logic: if no relevant context, let LLM answer from its own knowledge
         source_docs = result.get("source_documents", [])
         if not source_docs or all(not doc.page_content.strip() for doc in source_docs):
-            if not answer or answer.strip().lower() in ["i don't know", "no answer found."]:
-                answer = "I'm sorry, I couldn't find relevant information in the knowledge base, but here's what I know: " + validated_input
-        update_chat_history(validated_input, answer)
-        log_query(validated_input, answer, source="knowledge_base")
+            if not _ans or _ans.strip().lower() in ["i don't know", "no answer found."]:
+                _ans = "I'm sorry, I couldn't find relevant information in the knowledge base, but here's what I know: " + validated_input
+        update_chat_history(validated_input, _ans)
+        log_query(validated_input, _ans, source="knowledge_base")
         cleanup_memory()
-        return {"answer": answer, "result": result, "question": validated_input}
+        return {"answer": _ans, "result": result, "question": validated_input}
     except ValueError as ve:
         st.error(str(ve))
         log_query(user_input, f"Error: {str(ve)}", source="error")
@@ -557,8 +596,7 @@ def handle_supplement_command():
     
     if st.button("Get Supplement Recommendations"):
         try:
-            recommendations = secure_recommend_supplements(goal, diet_preferences)
-            st.markdown(recommendations)
+            st.markdown(secure_recommend_supplements(goal, diet_preferences))
             
             # add supplement safety information
             with st.expander("📋 Supplement Safety Guidelines"):
@@ -603,7 +641,7 @@ def visualize_rag_process(query, result):
     """Visualize the RAG process with source information"""
     with st.expander("🔍 View Sources and Context"):
         st.markdown("### Retrieved Context")
-        answer = result.get("answer", "")
+        _ans = result.get("answer", "")
         source_docs = result.get("source_documents", [])
         if not source_docs or all(not doc.page_content.strip() for doc in source_docs):
             st.info("No knowledge base source used for this answer.")
@@ -627,6 +665,24 @@ def visualize_rag_process(query, result):
                         st.markdown("**Relevant Content:**")
                         st.markdown(relevant or "_No relevant content_")
                     st.markdown("---")
+
+# Add a sidebar button to clear ChromaDB cache
+def clear_chromadb_cache():
+    from helpers.rag import clear_chromadb
+    
+    # Clear ChromaDB
+    if clear_chromadb():
+        st.sidebar.success("ChromaDB cache cleared successfully!")
+        # Clear streamlit cache
+        if 'chain' in st.session_state:
+            del st.session_state['chain']
+        # Clear the cached setup_chain function
+        setup_chain.clear()
+    else:
+        st.sidebar.error("Error clearing ChromaDB cache")
+
+if st.sidebar.button("🧹 Clear ChromaDB Cache"):
+    clear_chromadb_cache()
 
 if (submit_button or user_input) and user_input:
     with st.spinner("Generating your answer..."):

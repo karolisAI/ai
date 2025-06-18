@@ -1,9 +1,7 @@
-from typing import List, Dict, Any, Optional
+from typing import List
 from langchain.schema import BaseRetriever, Document
 from langchain_community.retrievers import BM25Retriever
 import tiktoken
-import numpy as np
-from functools import lru_cache
 
 class EnhancedRetriever(BaseRetriever):
     """Enhanced retriever with hybrid search and memory optimization."""

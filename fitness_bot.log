@@ -247,3 +247,20 @@
 2025-06-17 16:27:01,405 - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
 2025-06-17 16:27:01,418 - INFO - Query processed: {'timestamp': '2025-06-17T16:27:01.418090', 'user_input': 'hi', 'response': 'Hello! How can I assist you today?', 'source': 'knowledge_base'}
 2025-06-17 16:27:23,076 - INFO - Query processed: {'timestamp': '2025-06-17T16:27:23.075114', 'user_input': 'state my first query', 'response': "Error: Missing some input keys: {'formatted_history'}", 'source': 'error'}
+2025-06-18 07:24:32,086 - INFO - [RAG] Initializing minimal RAG chain with PDF_DIR=./data/Nippard_Hypertrophy/ and URLs=['https://exrx.net/Lists/Directory', 'https://www.acsm.org/education-resources/trending-topics-resources', 'https://www.eatright.org/fitness/exercise', 'https://journals.lww.com/nsca-jscr/pages/default.aspx', 'https://www.who.int/news-room/fact-sheets/detail/physical-activity', 'https://fdc.nal.usda.gov/']
+2025-06-18 07:24:45,812 - INFO - HTTP Request: POST https://api.openai.com/v1/embeddings "HTTP/1.1 200 OK"
+2025-06-18 07:24:46,732 - INFO - HTTP Request: POST https://api.openai.com/v1/embeddings "HTTP/1.1 200 OK"
+2025-06-18 07:24:48,245 - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-06-18 07:24:48,254 - INFO - Query processed: {'timestamp': '2025-06-18T07:24:48.254159', 'user_input': 'hello, according to nippard what excersize is best compund lower back exersize?', 'response': "I'm sorry, but I don't have specific information about what Jeff Nippard recommends as the best compound lower back exercise. You may want to refer to his content directly for that information.", 'source': 'knowledge_base'}
+2025-06-18 07:26:10,634 - INFO - Query processed: {'timestamp': '2025-06-18T07:26:10.634553', 'user_input': 'list all my questions that i asked', 'response': "Error: Missing some input keys: {'formatted_history'}", 'source': 'error'}
+2025-06-18 09:29:10,376 - INFO - [RAG] Initializing RAG chain with PDF_DIR=./data/Nippard_Hypertrophy/ and URLs=['https://exrx.net/Lists/Directory', 'https://www.acsm.org/education-resources/trending-topics-resources', 'https://www.eatright.org/fitness/exercise', 'https://journals.lww.com/nsca-jscr/pages/default.aspx', 'https://www.who.int/news-room/fact-sheets/detail/physical-activity', 'https://fdc.nal.usda.gov/']
+2025-06-18 09:29:10,772 - INFO - [RAG] Collection exists: False
+2025-06-18 09:29:10,772 - INFO - [RAG] Building new vectorstore...
+2025-06-18 09:29:17,111 - INFO - [RAG] Loaded 6 web documents
+2025-06-18 09:29:17,111 - INFO - [RAG] Split into 97 chunks
+2025-06-18 09:29:17,127 - INFO - Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+2025-06-18 09:29:18,250 - INFO - HTTP Request: POST https://api.openai.com/v1/embeddings "HTTP/1.1 200 OK"
+2025-06-18 09:29:18,906 - INFO - [RAG] Created vectorstore with 97 documents
+2025-06-18 09:29:18,906 - INFO - [RAG] RAG chain created successfully
+2025-06-18 09:29:19,115 - INFO - HTTP Request: POST https://api.openai.com/v1/embeddings "HTTP/1.1 200 OK"
+2025-06-18 09:29:19,146 - INFO - Query processed: {'timestamp': '2025-06-18T09:29:19.146119', 'user_input': 'What is hypertrophy?', 'response': "Error: Missing some input keys: {'query'}", 'source': 'error'}

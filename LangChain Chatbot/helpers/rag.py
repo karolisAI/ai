@@ -1,30 +1,21 @@
 from langchain_community.document_loaders import WebBaseLoader, PyPDFLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import LLMChainExtractor
-from langchain_core.documents import Document
-from data.extraction import extract_text_from_pdfs
-from helpers.baseretriever import EnhancedRetriever
-from helpers.monitoring import validate_embedding_dimensions, validate_embeddings, log_embedding_operation
-import os
-from dotenv import load_dotenv
-import tiktoken
-from typing import List, Dict, Any, Union
-import chromadb
-from chromadb.config import Settings
-from chromadb.api.types import Documents, EmbeddingFunction
-from langchain_openai import ChatOpenAI
-import time
-import shutil
-import numpy as np
-import logging
-from threading import Lock
-from datetime import datetime, timedelta
-import queue
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import ChatPromptTemplate
+from langchain.prompts.chat import MessagesPlaceholder
+from langchain.memory import ConversationBufferMemory
+import os
+from dotenv import load_dotenv
+import chromadb
+from chromadb.config import Settings
+import time
+import shutil
+import logging
+from datetime import datetime, timedelta
+import queue
+from threading import Lock
 
 # Rate limiting configuration
 class RateLimiter:
@@ -55,276 +46,194 @@ class RateLimiter:
             self.calls.put(now)
 
 # Initialize rate limiter
-RATE_LIMITER = RateLimiter(calls_per_minute=50)  # Conservative limit
+RATE_LIMITER = RateLimiter(calls_per_minute=50)
 
 load_dotenv()
 OPENAI_API = os.getenv("OPENAI_API_KEY")
 
 # Set USER_AGENT for web requests
 os.environ["USER_AGENT"] = os.getenv("USER_AGENT", "LangChain Fitness Chatbot/1.0")
-os.environ["REQUESTS_CA_BUNDLE"] = os.getenv("REQUESTS_CA_BUNDLE", "")  # Set empty if not provided
 
-def num_tokens_from_string(string: str, model_name="gpt-3.5-turbo"):
-    encoding = tiktoken.encoding_for_model(model_name)
-    return len(encoding.encode(string))
+# Always store Chroma data at project-root (one shared directory)
+CHROMA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "chroma_db"))
+chroma_dir = CHROMA_DIR
 
-def batch_embed(texts, embedder, batch_size=100, max_retries=3):
-    """
-    Embed texts in batches with retry logic and error handling.
-    
-    Args:
-        texts: List of texts to embed
-        embedder: Embedding model instance
-        batch_size: Maximum batch size (default: 100)
-        max_retries: Maximum number of retries for failed batches (default: 3)
-    
-    Returns:
-        List of embeddings
-    """
-    from helpers.monitoring import validate_embeddings, log_embedding_operation
-    
-    if not texts:
-        logging.warning("No texts provided for embedding")
-        return []
-    
-    # Ensure batch size doesn't exceed OpenAI's limit
-    MAX_BATCH_SIZE = 166  # OpenAI's maximum batch size
-    batch_size = min(batch_size, MAX_BATCH_SIZE)
-    
-    results = []
-    total_batches = (len(texts) + batch_size - 1) // batch_size
-    retry_delay = 1  # Initial retry delay in seconds
-    
+# Remove any stale vector-store inside the package directory (left-over from earlier code)
+_STALE_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
+if os.path.isdir(_STALE_DIR) and os.path.abspath(_STALE_DIR) != CHROMA_DIR:
     try:
-        # Get embedding dimension from a sample
-        sample_text = str(texts[0])  # Ensure string type
-        RATE_LIMITER.wait_if_needed()  # Rate limit check
-        sample_embedding = embedder.embed_query(sample_text)
-        expected_dim = len(sample_embedding)
-        
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            current_batch = (i // batch_size) + 1
-            
-            # Ensure batch doesn't exceed maximum size
-            if len(batch) > MAX_BATCH_SIZE:
-                logging.warning(f"Batch size {len(batch)} exceeds maximum {MAX_BATCH_SIZE}, truncating")
-                batch = batch[:MAX_BATCH_SIZE]
-            
-            # Ensure all texts are strings
-            batch = [str(text) for text in batch]
-            
-            for attempt in range(max_retries):
-                try:
-                    logging.info(f"Processing batch {current_batch}/{total_batches} (size: {len(batch)})")
-                    RATE_LIMITER.wait_if_needed()  # Rate limit check
-                    batch_results = embedder.embed_documents(batch)
-                    
-                    # Validate batch results
-                    validate_embeddings(batch_results, expected_dim)
-                    
-                    results.extend(batch_results)
-                    log_embedding_operation(
-                        "batch_embed",
-                        len(batch),
-                        len(texts),
-                        success=True
-                    )
-                    logging.info(f"Successfully embedded batch {current_batch}")
-                    break
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        log_embedding_operation(
-                            "batch_embed",
-                            len(batch),
-                            len(texts),
-                            success=False,
-                            error=str(e)
-                        )
-                        logging.error(f"Failed to embed batch {current_batch} after {max_retries} attempts: {str(e)}")
-                        raise RuntimeError(f"Failed to embed batch after {max_retries} attempts: {str(e)}")
-                    logging.warning(f"Attempt {attempt + 1} failed for batch {current_batch}, retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-        
-        # Validate final results
-        validate_embeddings(results, expected_dim)
-        return results
-        
-    except Exception as e:
-        log_embedding_operation(
-            "batch_embed",
-            batch_size,
-            len(texts),
-            success=False,
-            error=str(e)
-        )
-        raise RuntimeError(f"Failed to process embeddings: {str(e)}")
+        shutil.rmtree(_STALE_DIR)
+    except Exception as _e:  # log and ignore – not fatal
+        logging.warning(f"[RAG] Could not remove stale Chroma folder {_STALE_DIR}: {_e}")
 
-class OpenAIEmbeddingFunction(EmbeddingFunction):
-    """Wrapper for OpenAI embeddings to match ChromaDB's interface."""
+def get_rag_chain(pdf_dir, urls, max_tokens=1500):
+    """
+    Create a simple, robust RAG chain that works reliably.
+    This function handles all document loading, embedding, and chain creation.
+    """
+    logging.info(f"[RAG] Initializing RAG chain with PDF_DIR={pdf_dir} and URLs={urls}")
     
-    def __init__(self):
-        self.embeddings = OpenAIEmbeddings(api_key=OPENAI_API)
-        self.batch_size = 50  # Conservative batch size for ChromaDB interface
+    # Initialize OpenAI components
+    embeddings = OpenAIEmbeddings(api_key=OPENAI_API)
+    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo", api_key=OPENAI_API)
     
-    def __call__(self, input: Documents) -> List[List[float]]:
-        """Process documents in batches with proper error handling."""
-        if not input:
-            return []
-            
-        if isinstance(input, str):
-            input = [input]
-            
-        try:
-            # Use the improved batch_embed function with conservative batch size
-            return batch_embed(input, self.embeddings, batch_size=self.batch_size)
-        except Exception as e:
-            logging.error(f"Error in OpenAIEmbeddingFunction: {str(e)}")
-            raise RuntimeError(f"Failed to generate embeddings: {str(e)}")
-
-class DummyEmbeddingFunction(EmbeddingFunction):
-    """A dummy embedding function for Chroma that only handles queries."""
-    def __init__(self):
-        self.embeddings = OpenAIEmbeddings(api_key=OPENAI_API)
-    def __call__(self, input: Documents) -> List[List[float]]:
-        if isinstance(input, str):
-            input = [input]
-        return [self.embeddings.embed_query(text) for text in input]
-
-def get_combined_retriever(pdf_dir: str, urls: List[str], max_tokens: int = 500):
-    logging.info(f"[RAG] Initializing knowledge base with PDF_DIR={pdf_dir} and URLs={urls}")
-    # Initialize embeddings
-    embedder = OpenAIEmbeddings(api_key=OPENAI_API)
-    query_embedder = QueryEmbeddingFunction(OPENAI_API)
-    chroma_dir = "./chroma_db"
-    if os.path.exists(chroma_dir):
-        shutil.rmtree(chroma_dir)
+    # Set up ChromaDB
     client = chromadb.Client(Settings(persist_directory=chroma_dir, anonymized_telemetry=False))
     
-    # Load and process documents
-    documents = []
-    loaded_pdfs = set()  # Use a set to track unique PDFs
-    if pdf_dir and os.path.exists(pdf_dir):
-        pdf_loader = DirectoryLoader(pdf_dir, glob="**/*.pdf", loader_cls=PyPDFLoader)
-        pdf_docs = pdf_loader.load()
+    # Check if collection exists
+    collection_exists = False
+    try:
+        existing_collections = [col.name for col in client.list_collections()]
+        collection_exists = "fitness_docs" in existing_collections
+        logging.info(f"[RAG] Collection exists: {collection_exists}")
+    except Exception as e:
+        logging.warning(f"[RAG] Error checking collections: {e}")
+        collection_exists = False
+    
+    # Load and process documents if collection doesn't exist
+    if not collection_exists:
+        logging.info("[RAG] Building new vectorstore...")
+        documents = []
         
-        # Deduplicate PDFs based on source
-        unique_docs = {}
-        for doc in pdf_docs:
-            source = doc.metadata.get('source', 'unknown')
-            if source not in unique_docs:
-                unique_docs[source] = doc
-                loaded_pdfs.add(source)
+        # Load PDFs
+        if pdf_dir and os.path.exists(pdf_dir):
+            try:
+                pdf_loader = DirectoryLoader(pdf_dir, glob="**/*.pdf", loader_cls=PyPDFLoader)
+                pdf_docs = pdf_loader.load()
+                # Remove duplicates
+                unique_docs = {}
+                for doc in pdf_docs:
+                    source = doc.metadata.get('source', 'unknown')
+                    if source not in unique_docs:
+                        unique_docs[source] = doc
+                documents.extend(unique_docs.values())
+                logging.info(f"[RAG] Loaded {len(unique_docs)} unique PDFs")
+            except Exception as e:
+                logging.error(f"[RAG] Error loading PDFs: {e}")
         
-        documents.extend(unique_docs.values())
-        logging.info(f"[RAG] Loaded unique PDFs: {list(loaded_pdfs)}")
-    else:
-        logging.warning(f"[RAG] PDF directory not found: {pdf_dir}")
-    
-    loaded_urls = []
-    if urls:
-        web_loader = WebBaseLoader(urls)
-        web_docs = web_loader.load()
-        documents.extend(web_docs)
-        loaded_urls = [doc.metadata.get('source', 'unknown') for doc in web_docs]
-        logging.info(f"[RAG] Loaded URLs: {loaded_urls}")
-    else:
-        logging.warning("[RAG] No URLs provided.")
-    
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-        separators=["\n\n", "\n", " ", ""]
-    )
-    
-    split_docs = text_splitter.split_documents(documents) if documents else []
-    if split_docs:
-        try:
-            # Validate embedding dimensions with a sample
-            sample_text = split_docs[0].page_content
-            sample_embedding = embedder.embed_query(sample_text)
-            embedding_dim = len(sample_embedding)
-            validate_embedding_dimensions(embedding_dim, embedding_dim)
-            
-            texts = [doc.page_content for doc in split_docs]
-            metadatas = [doc.metadata for doc in split_docs]
-            ids = [f"doc_{i}" for i in range(len(split_docs))]
-            
-            # Use the improved batch_embed function
-            embeddings = batch_embed(texts, embedder, batch_size=100)
-            
-            collection = client.create_collection(
-                name="fitness_docs",
-                metadata={"hnsw:space": "cosine"},
-                embedding_function=None
+        # Load URLs
+        if urls:
+            try:
+                web_loader = WebBaseLoader(urls)
+                web_docs = web_loader.load()
+                documents.extend(web_docs)
+                logging.info(f"[RAG] Loaded {len(web_docs)} web documents")
+            except Exception as e:
+                logging.error(f"[RAG] Error loading URLs: {e}")
+        
+        # Split documents
+        if documents:
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                length_function=len
             )
+            split_docs = text_splitter.split_documents(documents)
+            logging.info(f"[RAG] Split into {len(split_docs)} chunks")
             
-            # Add documents in batches to avoid memory issues
-            batch_size = 100
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i + batch_size]
-                batch_metadatas = metadatas[i:i + batch_size]
-                batch_ids = ids[i:i + batch_size]
-                batch_embeddings = embeddings[i:i + batch_size]
-                
-                collection.add(
-                    documents=batch_texts,
-                    metadatas=batch_metadatas,
-                    ids=batch_ids,
-                    embeddings=batch_embeddings
-                )
-            
-            vectorstore = Chroma(
-                client=client,
+            # Create vectorstore
+            vectorstore = Chroma.from_documents(
+                documents=split_docs,
+                embedding=embeddings,
                 collection_name="fitness_docs",
-                embedding_function=query_embedder,
                 persist_directory=chroma_dir
             )
-            logging.info(f"[RAG] Successfully initialized vectorstore with {len(split_docs)} documents.")
-        except Exception as e:
-            logging.error(f"[RAG] Error during document processing: {str(e)}")
-            raise
+            logging.info(f"[RAG] Created vectorstore with {len(split_docs)} documents")
+        else:
+            logging.warning("[RAG] No documents found, creating empty vectorstore")
+            vectorstore = Chroma(
+                collection_name="fitness_docs",
+                embedding_function=embeddings,
+                persist_directory=chroma_dir
+            )
     else:
-        logging.error("[RAG] No documents loaded for initial knowledge base! Check PDF_DIR and URLs.")
-        collection = client.create_collection(
-            name="fitness_docs",
-            metadata={"hnsw:space": "cosine"},
-            embedding_function=None
-        )
+        # Load existing vectorstore
+        logging.info("[RAG] Loading existing vectorstore...")
         vectorstore = Chroma(
-            client=client,
             collection_name="fitness_docs",
-            embedding_function=query_embedder,
+            embedding_function=embeddings,
             persist_directory=chroma_dir
         )
     
-    base_retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 4}
+    # Create retriever
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        input_key="question",
+        output_key="answer",
+        return_messages=True
     )
-    compressor = LLMChainExtractor.from_llm(
-        llm=ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
+
+    # Prompt that includes the automatically injected chat history
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "You are an expert bodybuilding, fitness, and nutrition assistant. "
+                    "Use the conversation history to answer meta-questions such as listing or repeating" 
+                    "previous user questions. If the current user request is about earlier turns, quote or "
+                    "summarise those turns verbatim. Otherwise, answer the question using the retrieved "
+                    "fitness context. Cite sources when context is used; otherwise reply with 'General knowledge'."
+                ),
+            ),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            ("human", "{question}\n\nContext (if relevant):\n{context}")
+        ]
     )
-    compression_retriever = ContextualCompressionRetriever(
-        base_compressor=compressor,
-        base_retriever=base_retriever
+
+    # Build conversational chain with custom prompt
+    chain = ConversationalRetrievalChain.from_llm(
+        llm,
+        retriever,
+        memory=memory,
+        combine_docs_chain_kwargs={"prompt": qa_prompt},
+        return_source_documents=True,
     )
-    return EnhancedRetriever(
-        base_retriever=compression_retriever,
-        max_tokens=max_tokens
-    )
+    
+    logging.info("[RAG] Conversational RAG chain created successfully with custom prompt")
+    return chain
+
+def clear_chromadb(max_retries: int = 5) -> bool:
+    """Attempt to remove the on-disk Chroma directory.
+
+    On Windows the files can be locked by open mmap handles. We therefore
+    force a GC cycle and retry a few times before giving up.
+    """
+    if not os.path.exists(chroma_dir):
+        return True
+
+    import gc
+    import time
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            shutil.rmtree(chroma_dir)
+            logging.info("[RAG] ChromaDB cleared successfully")
+            return True
+        except PermissionError as e:
+            logging.warning(
+                f"[RAG] Attempt {attempt}/{max_retries}: ChromaDB directory in use ({e}). Retrying..."
+            )
+            gc.collect()
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"[RAG] Unexpected error clearing ChromaDB: {e}")
+            return False
+
+    logging.error("[RAG] Failed to clear ChromaDB directory after retries")
+    return False
 
 def cleanup_vector_stores():
     """Clean up all vector store related directories and caches"""
     paths_to_clean = [
-        "./chroma_db",
+        CHROMA_DIR,
         "./.chroma",
         "./.cache",
         "./cache",
         "./__pycache__",
-        "./helpers/__pycache__"
+        os.path.join(os.path.dirname(__file__), "__pycache__")
     ]
     
     for path in paths_to_clean:
@@ -334,151 +243,3 @@ def cleanup_vector_stores():
                 shutil.rmtree(path)
             except Exception as e:
                 print(f"Error removing {path}: {str(e)}")
-
-class QueryEmbeddingFunction:
-    """Wrapper for OpenAI embeddings to handle query embedding."""
-    def __init__(self, api_key):
-        self.embeddings = OpenAIEmbeddings(api_key=api_key)
-    
-    def __call__(self, input: Union[str, List[str], Documents]) -> List[List[float]]:
-        """Handle both string and document inputs for embedding."""
-        if isinstance(input, (str, bytes)):
-            RATE_LIMITER.wait_if_needed()
-            return [self.embeddings.embed_query(str(input))]
-        elif isinstance(input, list):
-            results = []
-            for text in input:
-                RATE_LIMITER.wait_if_needed()
-                results.append(self.embeddings.embed_query(str(text)))
-            return results
-        else:
-            raise ValueError(f"Unsupported input type: {type(input)}")
-    
-    def embed_query(self, text: Union[str, bytes]) -> List[float]:
-        """Embed a single query text."""
-        RATE_LIMITER.wait_if_needed()
-        return self.embeddings.embed_query(str(text))
-
-def create_embeddings_from_texts(texts, embeddings, save_path=None):
-    """Create embeddings from texts using ChromaDB"""
-    documents = []
-    for txt in texts:
-        documents.append({"page_content": txt['content'], "metadata": {"source": txt['file_name']}})
-
-    # Create ChromaDB collection
-    client = chromadb.Client(Settings(
-        persist_directory="./chroma_db",
-        anonymized_telemetry=False
-    ))
-    
-    collection = client.get_or_create_collection(
-        name="fitness_knowledge",
-        metadata={"hnsw:space": "cosine"}
-    )
-    
-    # Add documents to collection
-    collection.add(
-        documents=[doc['page_content'] for doc in documents],
-        metadatas=[doc['metadata'] for doc in documents],
-        ids=[f"doc_{i}" for i in range(len(documents))]
-    )
-    
-    # Create and return vectorstore
-    vectorstore = Chroma(
-        client=client,
-        collection_name="fitness_knowledge",
-        embedding_function=embeddings
-    )
-    
-    return vectorstore
-
-def get_rag_chain(pdf_dir, urls, max_tokens=1500):
-    logging.info(f"[RAG] Initializing minimal RAG chain with PDF_DIR={pdf_dir} and URLs={urls}")
-    embedder = OpenAIEmbeddings(api_key=OPENAI_API)
-    chroma_dir = "./chroma_db"
-    client = chromadb.Client(Settings(persist_directory=chroma_dir, anonymized_telemetry=False))
-
-    # Only build and embed if the vectorstore does not exist
-    if not os.path.exists(chroma_dir) or not os.listdir(chroma_dir):
-        documents = []
-        loaded_pdfs = set()
-        if pdf_dir and os.path.exists(pdf_dir):
-            pdf_loader = DirectoryLoader(pdf_dir, glob="**/*.pdf", loader_cls=PyPDFLoader)
-            pdf_docs = pdf_loader.load()
-            unique_docs = {}
-            for doc in pdf_docs:
-                source = doc.metadata.get('source', 'unknown')
-                if source not in unique_docs:
-                    unique_docs[source] = doc
-                    loaded_pdfs.add(source)
-            documents.extend(unique_docs.values())
-        if urls:
-            web_loader = WebBaseLoader(urls)
-            web_docs = web_loader.load()
-            documents.extend(web_docs)
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""]
-        )
-        split_docs = text_splitter.split_documents(documents) if documents else []
-        texts = [doc.page_content for doc in split_docs]
-        metadatas = [doc.metadata for doc in split_docs]
-        ids = [f"doc_{i}" for i in range(len(split_docs))]
-
-        if split_docs:
-            collection = client.create_collection(
-                name="fitness_docs",
-                metadata={"hnsw:space": "cosine"},
-                embedding_function=None
-            )
-            batch_size = 100
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i + batch_size]
-                batch_metadatas = metadatas[i:i + batch_size]
-                batch_ids = ids[i:i + batch_size]
-                batch_embeddings = embedder.embed_documents(batch_texts)
-                collection.add(
-                    documents=batch_texts,
-                    metadatas=batch_metadatas,
-                    ids=batch_ids,
-                    embeddings=batch_embeddings
-                )
-    # Always load the vectorstore
-    vectorstore = Chroma(
-        client=client,
-        collection_name="fitness_docs",
-        embedding_function=embedder,
-        persist_directory=chroma_dir
-    )
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo", api_key=OPENAI_API)
-
-    # Detailed system prompt
-    system_prompt = (
-        "You are an expert bodybuilding, fitness, and nutrition assistant.\n"
-        "Your job is to answer user questions using the following sources, in order of priority:\n"
-        "1. User-Uploaded Documents and Links: If the user has uploaded any documents (PDFs, text files) or provided custom links, always check these first for relevant information. If you find an answer here, cite the specific document or link as the source.\n"
-        "2. Main Knowledge Base: If the answer is not found in the user-uploaded materials, search the main knowledge base, which includes trusted fitness and nutrition resources (e.g., scientific articles, reputable websites, and expert guides). If you find an answer here, cite the specific PDF or URL as the source.\n"
-        "3. General Knowledge: If neither the user-uploaded materials nor the main knowledge base contain the answer, use your own knowledge as a fitness and nutrition expert to provide a helpful, safe, and evidence-based answer. Clearly state when you are answering from general knowledge and not from a specific source.\n"
-        "If the user asks you to repeat, summarize, or list their previous questions, use the list below and quote the previous user questions word-for-word, in order. If the user asks for a question in quotation marks, wrap the exact question in double quotes.\n"
-        "Additional Instructions: Always answer in a friendly, professional, and supportive tone. If the user's question is unclear, ask for clarification. If the question is outside the scope of fitness, bodybuilding, or nutrition, politely decline and redirect to relevant topics. If the user asks about previous questions or chat history, use the conversation context to answer as accurately as possible. Always include a 'Sources' section, listing the document, link, or stating 'No knowledge base source used for this answer' if applicable. Never provide medical advice; always recommend consulting a healthcare professional for medical concerns.\n"
-        "Safety Notice: Remind users to consult healthcare providers before starting new exercise or nutrition programs, especially if they have pre-existing conditions.\n"
-        "\nPrevious User Questions (in order):\n{formatted_history}\n"
-    )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("user", "{question}")
-    ])
-
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        condense_question_prompt=prompt,
-        return_source_documents=True,
-        max_tokens_limit=max_tokens
-    )
-    return chain

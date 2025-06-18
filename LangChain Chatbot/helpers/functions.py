@@ -1,5 +1,4 @@
-from typing import List, Dict, Any, Set
-from helpers.security import sanitize_workout_input
+from typing import List, Set
 from dataclasses import dataclass
 
 class WorkoutGenerationError(Exception):
@@ -364,7 +363,7 @@ def format_calorie_response(calories: int, goal: str, activity_level: str) -> st
     if goal.lower() == 'lose weight':
         response.extend([
             "📉 **Weight Loss Breakdown:**",
-            f"- This represents a 500 calorie deficit",
+            "- This represents a 500 calorie deficit",
             "- Expected weight loss: ~0.5kg (1lb) per week",
             "- Focus on protein intake (1.6-2.2g per kg of body weight)",
             "- Include plenty of vegetables for satiety"
@@ -372,7 +371,7 @@ def format_calorie_response(calories: int, goal: str, activity_level: str) -> st
     elif goal.lower() == 'gain weight':
         response.extend([
             "📈 **Weight Gain Breakdown:**",
-            f"- This represents a 500 calorie surplus",
+            "- This represents a 500 calorie surplus",
             "- Expected weight gain: ~0.5kg (1lb) per week",
             "- Prioritize protein (1.6-2.2g per kg of body weight)",
             "- Include complex carbs for energy"
