@@ -178,8 +178,7 @@ def get_rag_chain(pdf_dir, urls, max_tokens=1500):
                     "fitness context. Cite sources when context is used; otherwise reply with 'General knowledge'."
                 ),
             ),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("human", "{question}\n\nContext (if relevant):\n{context}")
+            ("human", "Question: {question}\n\nContext:\n{context}")
         ]
     )
 
@@ -196,34 +195,35 @@ def get_rag_chain(pdf_dir, urls, max_tokens=1500):
     return chain
 
 def clear_chromadb(max_retries: int = 5) -> bool:
-    """Attempt to remove the on-disk Chroma directory.
+    """Delete the `fitness_docs` collection (if any) and remove on-disk data.
 
-    On Windows the files can be locked by open mmap handles. We therefore
-    force a GC cycle and retry a few times before giving up.
+    The PersistentClient API is used first to drop the collection so that all
+    MMAP handles are closed cleanly. After that the directory is removed. On
+    Windows we still retry a few times to cope with the OS file-lock latency.
     """
-    if not os.path.exists(chroma_dir):
+    try:
+        # allow_reset flag needed from Chroma 0.4.22 onwards
+        client = chromadb.PersistentClient(
+            path=chroma_dir,
+            settings=Settings(persist_directory=chroma_dir, allow_reset=True)
+        )
+        client.reset()  # clear everything atomically (fast path)
+        logging.info("[RAG] Chroma client reset – all collections removed")
         return True
-
-    import gc
-    import time
-
-    for attempt in range(1, max_retries + 1):
+    except Exception as e:
+        logging.warning(f"[RAG] reset() unavailable – falling back to per-collection delete ({e})")
         try:
-            shutil.rmtree(chroma_dir)
-            logging.info("[RAG] ChromaDB cleared successfully")
+            client = chromadb.PersistentClient(path=chroma_dir)
+            for col in client.list_collections():
+                try:
+                    client.delete_collection(name=col.name)  # fully removes collection files
+                    logging.info(f"[RAG] Deleted collection {col.name}")
+                except Exception as _e:
+                    logging.warning(f"[RAG] Could not delete collection {col.name}: {_e}")
             return True
-        except PermissionError as e:
-            logging.warning(
-                f"[RAG] Attempt {attempt}/{max_retries}: ChromaDB directory in use ({e}). Retrying..."
-            )
-            gc.collect()
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"[RAG] Unexpected error clearing ChromaDB: {e}")
+        except Exception as e2:
+            logging.error(f"[RAG] Failed fallback Chroma clear: {e2}")
             return False
-
-    logging.error("[RAG] Failed to clear ChromaDB directory after retries")
-    return False
 
 def cleanup_vector_stores():
     """Clean up all vector store related directories and caches"""
@@ -232,6 +232,8 @@ def cleanup_vector_stores():
         "./.chroma",
         "./.cache",
         "./cache",
+        "./web_faiss_index",
+        "./combined_faiss_index",
         "./__pycache__",
         os.path.join(os.path.dirname(__file__), "__pycache__")
     ]
@@ -243,3 +245,20 @@ def cleanup_vector_stores():
                 shutil.rmtree(path)
             except Exception as e:
                 print(f"Error removing {path}: {str(e)}")
+
+def batch_embed(texts, embedder, batch_size: int = 50, max_retries: int = 3):
+    """Embed texts in batches with simple retry logic."""
+    embeddings = []
+    for i in range(0, len(texts), batch_size):
+        sub_texts = texts[i:i+batch_size]
+        for attempt in range(max_retries):
+            try:
+                RATE_LIMITER.wait_if_needed()
+                embeddings.extend(embedder.embed_documents(sub_texts))
+                break
+            except Exception as e:
+                logging.warning(f"[RAG] Embedding batch failed (attempt {attempt+1}/{max_retries}): {e}")
+                time.sleep(1)
+        else:
+            raise RuntimeError("Embedding failed after retries")
+    return embeddings

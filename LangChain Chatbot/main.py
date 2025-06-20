@@ -308,7 +308,7 @@ langchain.cache = InMemoryCache()
 MEMORY_WINDOW = 5  # Number of message pairs to keep in memory
 MAX_TOKENS_PER_QUERY = 1000
 
-APP_VERSION = "v1.0-debug-fh"
+APP_VERSION = "v1.0"
 
 st.sidebar.info(f"App Version: {APP_VERSION}")
 
@@ -348,7 +348,7 @@ def _normalize(text: str) -> str:
 def detect_history_request(text: str):
     """Return one of 'list', 'last', None based on user query."""
     t = _normalize(text)
-    if "last question" in t:
+    if "last question" in t or "previous question" in t or "did i just ask" in t:
         return "last"
     # list/show all questions i have asked
     if "question" in t and ("list" in t or "show" in t or "all" in t):
@@ -388,8 +388,7 @@ def handle_chat_interaction(user_input):
             hist_msgs = []
 
         input_dict = {
-            "question": validated_input,
-            "chat_history": hist_msgs  # satisfies MessagesPlaceholder
+            "question": validated_input
         }
         print(f"[DEBUG] chain.invoke input: {input_dict}")
         result = chain.invoke(input_dict)
@@ -669,17 +668,18 @@ def visualize_rag_process(query, result):
 # Add a sidebar button to clear ChromaDB cache
 def clear_chromadb_cache():
     from helpers.rag import clear_chromadb
-    
-    # Clear ChromaDB
+
+    # Drop any live chain to close open file handles BEFORE filesystem delete
+    if 'chain' in st.session_state:
+        del st.session_state['chain']
+    # Ensure cache of setup_chain is cleared so next call rebuilds
+    setup_chain.clear()
+
+    # Clear on-disk Chroma data
     if clear_chromadb():
-        st.sidebar.success("ChromaDB cache cleared successfully!")
-        # Clear streamlit cache
-        if 'chain' in st.session_state:
-            del st.session_state['chain']
-        # Clear the cached setup_chain function
-        setup_chain.clear()
+        st.sidebar.success("ChromaDB cache cleared successfully! Knowledge base will rebuild on next query.")
     else:
-        st.sidebar.error("Error clearing ChromaDB cache")
+        st.sidebar.error("Error clearing ChromaDB cache – some files may still be locked.")
 
 if st.sidebar.button("🧹 Clear ChromaDB Cache"):
     clear_chromadb_cache()
