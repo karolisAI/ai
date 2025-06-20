@@ -3,3 +3,6 @@ streamlit_output.log
 .env
 .venv
 .vscode
+
+# Exclude user uploads
+/data/uploads/

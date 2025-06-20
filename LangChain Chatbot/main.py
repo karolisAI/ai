@@ -237,7 +237,7 @@ def handle_document_upload():
                             try:
                                 embeddings = batch_embed(texts, embedder, batch_size=50, max_retries=3)
                                 validate_embeddings(embeddings)
-                                collection = temp_retriever._base_retriever.vectorstore._collection
+                                collection = temp_retriever.retriever.vectorstore._collection
                                 batch_size = 50
                                 for i in range(0, len(texts), batch_size):
                                     batch_texts = texts[i:i + batch_size]

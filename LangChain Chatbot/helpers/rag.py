@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timedelta
 import queue
 from threading import Lock
+import chromadb.api
 
 # Rate limiting configuration
 class RateLimiter:
@@ -65,6 +66,8 @@ if os.path.isdir(_STALE_DIR) and os.path.abspath(_STALE_DIR) != CHROMA_DIR:
         shutil.rmtree(_STALE_DIR)
     except Exception as _e:  # log and ignore – not fatal
         logging.warning(f"[RAG] Could not remove stale Chroma folder {_STALE_DIR}: {_e}")
+
+os.environ.setdefault("ALLOW_RESET", "TRUE")
 
 def get_rag_chain(pdf_dir, urls, max_tokens=1500):
     """
@@ -202,6 +205,12 @@ def clear_chromadb(max_retries: int = 5) -> bool:
     Windows we still retry a few times to cope with the OS file-lock latency.
     """
     try:
+        # reset global state to avoid instance-conflict errors
+        try:
+            chromadb.api.global_state.reset_state()
+        except Exception:
+            pass
+
         # allow_reset flag needed from Chroma 0.4.22 onwards
         client = chromadb.PersistentClient(
             path=chroma_dir,
