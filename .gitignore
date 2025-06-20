@@ -1,8 +1,11 @@
-fitness_bot.log
-streamlit_output.log
+.fitness_bot.log
+
 .env
 .venv
 .vscode
 
-# Exclude user uploads
-/data/uploads/
+.pytest_cache
+.ruff_cache
+.chroma_db
+.pytest_cache
+.ruff_cache

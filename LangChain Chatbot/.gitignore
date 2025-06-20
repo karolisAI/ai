@@ -2,17 +2,6 @@
 .DS_STORE
 __pycache__
 fitness_bot.log
-.pytest_cache
-.ruff_cache
-.chroma_db
-__init__.py
-web_faiss_index.pkl
-web_faiss_index.pkl.gz
-web_faiss_index.pkl.gz.part
-web_faiss_index.pkl.gz.part.1
-web_faiss_index.pkl.gz.part.2
-web_faiss_index.pkl.gz.part.3
-web_faiss_index.pkl.gz.part.4
-web_faiss_index.pkl.gz.part.5
-web_faiss_index.pkl.gz.part.6
-web_faiss_index.pkl.gz.part.7
+
+# Exclude user uploads
+/data/uploads/
