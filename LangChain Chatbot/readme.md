@@ -1,6 +1,28 @@
 # 🏋️ AI Bodybuilding Coach
 
-An intelligent chatbot powered by LangChain that provides personalized fitness advice, workout plans, and nutrition guidance. The application combines the power of large language models with a curated knowledge base of fitness resources.
+> Retrieval-Augmented fitness assistant that turns scientific PDFs and trusted web content into personalised coaching.
+
+## Situation–Complication–Resolution (SCR)
+
+* **Situation** Fitness information is scattered across blogs, forums and research papers; beginners are overwhelmed.
+* **Complication** Quality varies, often lacks citations and ignores personal metrics — risking poor results or injury.
+* **Resolution** This project combines Retrieval-Augmented Generation (LangChain + ChromaDB) with a Streamlit UI to deliver context-aware answers, calorie/workout tools and document upload—all with clear source citations.
+
+## Quick diagram
+
+```mermaid
+flowchart LR
+    subgraph User
+        A[Question / PDF Upload]
+    end
+    A -->|embeds| B(OpenAI Embeddings)
+    B --> C{ChromaDB Vector Store}
+    A -->|question| D(ConversationalRetrievalChain)
+    C --retrieves--> D
+    D -->|Answer + Sources| A
+```
+
+➡️  Ethical & privacy considerations live in [ETHICS.md](../ETHICS.md).
 
 ## 🌟 Features
 
@@ -134,6 +156,17 @@ The application uses a combination of:
 - Source citations with relevance scores
 - PDF and URL references
 - Document management interface
+
+## ✅ Testing
+
+```bash
+# unit + smoke tests
+pytest -q
+```
+
+The smoke test spins up Streamlit in the background, fires three queries
+(`what is hypertrophy`, `what was my last question`, `list all my questions`)
+and fails if any answer is wrong.  Use it before every commit.
 
 ## 🤝 Contributing
 
